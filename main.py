@@ -4,6 +4,7 @@ import json
 import os
 import glob
 import logging
+import requests
 from selenium import webdriver
 from selenium.common.exceptions import (
     TimeoutException,
@@ -31,6 +32,9 @@ FILE_PATH = input()
 
 
 class Config:
+    # API TOKEN dadata.ru
+    API_TOKEN = "59f9860b1a49ce27e03bf4c9c30668970b60a584"
+
     # Путь для сохранения PDF
     PDF_OUTPUT_DIR = os.path.join(os.getcwd(), "REPORTS")
 
@@ -133,18 +137,23 @@ def save_to_db(data):
             status=data.get("status"),
         )
         case_numbers = []
-        for i in range(len(data["bankruptcy_cases"])):
-            case = BankruptcyCase(
-                case_number=data["bankruptcy_cases"][i]["case_number"],
-                inn=data["inn"],
-                claimant_name=data["bankruptcy_cases"][i]["claimant_name"],
-                judge_name=data["bankruptcy_cases"][i]["judge_name"],
-                creditors="; ".join(data["bankruptcy_cases"][i]["creditors"]),
-                third_parties="; ".join(data["bankruptcy_cases"][i]["third_parties"]),
-                others="; ".join(data["bankruptcy_cases"][i]["others"]),
-            )
-            case_numbers.append(case.case_number)
-            session.add(case)
+        try:
+            for i in range(len(data["bankruptcy_cases"])):
+                case = BankruptcyCase(
+                    case_number=data["bankruptcy_cases"][i]["case_number"],
+                    inn=data["inn"],
+                    claimant_name=data["bankruptcy_cases"][i]["claimant_name"],
+                    judge_name=data["bankruptcy_cases"][i]["judge_name"],
+                    creditors="; ".join(data["bankruptcy_cases"][i]["creditors"]),
+                    third_parties="; ".join(
+                        data["bankruptcy_cases"][i]["third_parties"]
+                    ),
+                    others="; ".join(data["bankruptcy_cases"][i]["others"]),
+                )
+                case_numbers.append(case.case_number)
+                session.add(case)
+        except Exception as e:
+            logging.error(f"Ошибка при обработке банковских дел: {str(e)}.")
         entity.bankruptcy_cases = ", ".join(case_numbers)
         session.add(entity)
         session.commit()
@@ -462,71 +471,59 @@ def check_inn_with_dadata(inn) -> dict:
         "status": None,
     }
     try:
-        options = webdriver.ChromeOptions()
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        driver = webdriver.Chrome(options=options)
-        driver.set_window_size(*Config.SELENIUM_WINDOW_SIZE)
-        driver.get("https://dadata.ru/api/find-party/")
+        # URL API DaData
+        url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
 
-        # Редактирование и отправка запроса
-        edit_request = driver.find_element(
-            By.XPATH,
-            """//div[contains(text(), '"query":')]""",
-        )
-        edit_request.click()
-        edit_request.send_keys(Keys.CONTROL + "a")
-        edit_request.send_keys('{ "query": "', inn, '" }')
-        send_button = driver.find_element(
-            By.XPATH,
-            "//button[@data-test='sandbox-btn']",
-        )
-        send_button.click()
+        # Заголовки запроса
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "Accept-Charset": "utf-8",
+            "Authorization": f"Token {Config.API_TOKEN}",
+        }
 
-        # Ожидание запроса
-        time.sleep(1.5)
-        wait_for_element(driver, "//pre[@data-test='sandbox-results']")
+        # Тело запроса
+        payload = {"query": str(inn)}
 
-        # Парсинг JSON ответа
-        json_data = json.loads(
-            driver.find_element(By.XPATH, "//pre[@data-test='sandbox-results']").text
-        )
-        suggestion = json_data.get("suggestions", [{}])[0]
-        data = suggestion.get("data", {})
-        name_info = data.get("name", {})
-        state_info = data.get("state", {})
-        address_info = data.get("address", {})
-        founder_info = (
-            data.get("founders", [{}])[0].get("fio", {}) if data.get("founders") else {}
-        )
+        # Отправка запроса
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()  # Проверка на ошибки
+
+        # Парсинг ответа
+        data = response.json().get("suggestions")[0].get("data")
+
         result.update(
             {
-                "name_full": name_info.get("full_with_opf"),
-                "name_short": name_info.get("short_with_opf"),
-                "fio": (
-                    " ".join(
-                        filter(
-                            None,
-                            [
-                                founder_info.get("surname"),
-                                founder_info.get("name"),
-                                founder_info.get("patronymic"),
-                            ],
-                        )
-                    )
-                    if founder_info
-                    else None
-                ),
+                "name_full": data.get("name", {}).get("full_with_opf"),
+                "name_short": data.get("name", {}).get("short_with_opf"),
                 "okato": data.get("okato"),
                 "oktmo": data.get("oktmo"),
                 "okpo": data.get("okpo"),
-                "address": address_info.get("data"),
-                "status": state_info.get("status"),
+                "address": data.get("address", {}).get("data"),
+                "status": data.get("state", {}).get("status"),
             }
         )
+
+        founders = data.get("founders")
+        try:
+            for founder in founders:
+                if founder.get("type") == "PHYSICAL":
+                    founder_fio = founder.get("fio", {})
+                    result["fio"] = " ".join(
+                        founder_fio.get("surname", {}),
+                        founder_fio.get("name"),
+                        founder_fio.get("patronymic"),
+                    )
+        except Exception as e:
+            logging.error(
+                f"Не удалось получить fio ИП от DaData для ИНН {inn}: {str(e)}"
+            )
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Ошибка при запросе к API DaData для ИНН {inn}: {str(e)}")
     except Exception as e:
-        logging.error(f"Ошибка при проверке ИНН {inn} через DaData: {str(e)}")
+        logging.error(f"Ошибка при обработке ответа от DaData для ИНН {inn}: {str(e)}")
     finally:
-        driver.quit()
         return result
 
 
