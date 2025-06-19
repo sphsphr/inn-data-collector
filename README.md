@@ -14,6 +14,7 @@
 ## Технологии
 
 + Selenium
++ Requests
 + SQLAlchemy
 + Pandas (для обработки Excel)
 
