@@ -122,6 +122,7 @@ def save_to_db(data):
                 f"Удалены старые данные для ИНН {data["inn"]} перед обновлением"
             )
 
+        # Формируем запрос
         entity = LegalEntity(
             inn=data.get("inn"),
             ip_name=data.get("ip_name"),
@@ -198,11 +199,13 @@ def save_as_pdf(url, output_dir, filename="document.pdf") -> str:
         wait_for_element(driver, "//div[contains(text(),'ОГРН')]")
         time.sleep(3)
         # Жмем кнопку принять cookie, чтобы она не блокировала обзор
-        cookie_button_accept = driver.find_element(
-            By.XPATH,
+        cookie_button_accept = wait_for_element(
+            driver,
             "//button[@class='btn-accept btn-accept_hover btn-accept_properties']",
+            raise_exception=False,
         )
-        cookie_button_accept.click()
+        if cookie_button_accept:
+            cookie_button_accept.click()
         # Сохраняем страницу
         driver.execute_script("window.print();")
         time.sleep(1)
@@ -349,13 +352,14 @@ def check_fedresurs(inn) -> dict:
             logging.info(f"Для ИНН {inn} нет дел о банкротстве на Fedresurs")
             return result
         # Собираем данные о банкротстве
-        try:
-            bankruptcy_cases_raw = driver.find_elements(
-                By.XPATH, "//a[@class='underlined info-header']"
-            )
-            result["bankruptcy_cases"] = [case.text for case in bankruptcy_cases_raw]
-        except TimeoutException:
-            logging.warning(f"Не удалось найти дела о банкротстве для ИНН {inn}")
+        bankruptcy_cases_raw = driver.find_elements(
+            By.XPATH, "//a[@class='underlined info-header']"
+        )
+        result["bankruptcy_cases"] = [case.text for case in bankruptcy_cases_raw]
+    except TimeoutException:
+        logging.warning(
+            f"Истекло время ожидания сбора данных с Fedresurs для ИНН {inn}"
+        )
     except Exception as e:
         logging.error(f"Ошибка при проверке ИНН {inn} на Fedresurs: {str(e)}")
     finally:
@@ -363,6 +367,7 @@ def check_fedresurs(inn) -> dict:
         return result
 
 
+# Собираем данные с kad.arbitr
 def check_kad_arbitr(bankruptcy_case: str) -> dict:
     result = {
         "case_number": bankruptcy_case,
@@ -404,16 +409,13 @@ def check_kad_arbitr(bankruptcy_case: str) -> dict:
             logging.info(f"Дело {bankruptcy_case} не найдено на Kad.Arbitr")
             return result
         # Собираем информацию о судье и истце
-        try:
-            result["judge_name"] = driver.find_element(
-                By.XPATH,
-                "//div[@class='judge']",
-            ).text
-            result["claimant_name"] = driver.find_element(
-                By.XPATH, "//td[@class='plaintiff']/div/div/span"
-            ).text
-        except Exception as e:
-            logging.error(f"Ошибка при поиске судьи или истца: {str(e)}")
+        result["judge_name"] = driver.find_element(
+            By.XPATH,
+            "//div[@class='judge']",
+        ).text
+        result["claimant_name"] = driver.find_element(
+            By.XPATH, "//td[@class='plaintiff']/div/div/span"
+        ).text
 
         # Кликаем на дело
         case_link_button = driver.find_element(By.XPATH, "//a[@class='num_case']")
@@ -429,8 +431,7 @@ def check_kad_arbitr(bankruptcy_case: str) -> dict:
                 By.XPATH,
                 "//li[@class='case-print']//a",
             )
-            if print_people_button:
-                print_people_button.click()
+            print_people_button.click()
             wait_for_element(driver, "//li[@class='chrono active']")
 
             creditors_raw = driver.find_elements(
@@ -452,6 +453,10 @@ def check_kad_arbitr(bankruptcy_case: str) -> dict:
             )
             if others_raw:
                 result["others"] = [other.text for other in others_raw]
+    except TimeoutException:
+        logging.warning(
+            f"Истекло время ожидания сбора данных с kad.arbitr для дела {bankruptcy_case}"
+        )
     except Exception as e:
         logging.error(f"Ошибка при проверке дела {bankruptcy_case}: {str(e)}")
     finally:
@@ -459,6 +464,7 @@ def check_kad_arbitr(bankruptcy_case: str) -> dict:
         return result
 
 
+# Собираем данные с помощью dadata
 def check_inn_with_dadata(inn) -> dict:
     result = {
         "name_full": None,
@@ -491,16 +497,16 @@ def check_inn_with_dadata(inn) -> dict:
 
         # Парсинг ответа
         data = response.json().get("suggestions")[0].get("data")
-
+        
         result.update(
             {
-                "name_full": data.get("name", {}).get("full_with_opf"),
-                "name_short": data.get("name", {}).get("short_with_opf"),
+                "name_full": data.get("name").get("full_with_opf"),
+                "name_short": data.get("name").get("short_with_opf"),
                 "okato": data.get("okato"),
                 "oktmo": data.get("oktmo"),
                 "okpo": data.get("okpo"),
-                "address": data.get("address", {}).get("data"),
-                "status": data.get("state", {}).get("status"),
+                "address": data.get("address").get("data"),
+                "status": data.get("state").get("status"),
             }
         )
 
@@ -508,11 +514,13 @@ def check_inn_with_dadata(inn) -> dict:
         try:
             for founder in founders:
                 if founder.get("type") == "PHYSICAL":
-                    founder_fio = founder.get("fio", {})
+                    founder_fio = founder.get("fio")
                     result["fio"] = " ".join(
-                        founder_fio.get("surname", {}),
-                        founder_fio.get("name"),
-                        founder_fio.get("patronymic"),
+                        [
+                            founder_fio.get("surname"),
+                            founder_fio.get("name"),
+                            founder_fio.get("patronymic"),
+                        ]
                     )
         except Exception as e:
             logging.error(
@@ -540,14 +548,12 @@ def main():
     logging.info(f"Найдено {len(inn_list)} ИНН для обработки")
     for inn in inn_list:
         try:
-            logging.info(f"Обработка ИНН: {inn}")
+            logging.info(f"Начало обработки ИНН: {inn}")
             validate_inn(inn)
 
             # Сбор данных с Fedresurs
             fedresurs_data = check_fedresurs(inn)
-            if not fedresurs_data.get("ip_name") or not fedresurs_data.get(
-                "bankruptcy_cases"
-            ):
+            if not fedresurs_data.get("ip_name"):
                 logging.warning(f"Не найдено данных для ИНН {inn} на Fedresurs")
                 continue
 
@@ -577,9 +583,9 @@ def main():
             }
             # Сохранение в БД
             if save_to_db(combined_data):
-                logging.info(f"Данные для ИНН {inn} успешно сохранены")
+                logging.info(f"Данные для ИНН {inn} успешно сохранены в БД")
             else:
-                logging.error(f"Не удалось сохранить данные для ИНН {inn}")
+                logging.error(f"Не удалось сохранить данные в БД для ИНН {inn}")
 
         except ValueError as e:
             logging.error(f"Неверный ИНН {inn}: {str(e)}. ИНН будет пропущен.")
@@ -588,7 +594,7 @@ def main():
             logging.error(f"Ошибка при обработке ИНН {inn}: {str(e)}.")
             continue
         finally:
-            logging.info(f"Конец проверки {inn}")
+            logging.info(f"Конец обработки {inn}")
 
 
 if __name__ == "__main__":
